@@ -356,7 +356,11 @@ public:
    *
    * @param onProblem A callback that will be called when a parsing error
    *   occurs. Problems can either be recoverable, indicating some data could
-   *   not be read, or non-recoverable, stopping the iteration.
+   *   not be read, or non-recoverable, stopping the iteration. When a file
+   *   order read finishes without error, or has nothing to read, the trailing
+   *   magic bytes are checked and a `MagicMismatch` problem is reported if
+   *   they are missing or wrong, so a truncated file is reported after its
+   *   last message.
    * @param startTime Optional start time in nanoseconds. Messages before this
    *   time will not be returned.
    * @param endTime Optional end time in nanoseconds. Messages equal to or after
@@ -734,6 +738,8 @@ private:
   ByteOffset dataEnd_;
   ReadMessageOptions readMessageOptions_;
   const ProblemCallback onProblem_;
+
+  void checkTrailingMagic();
 };
 
 }  // namespace mcap

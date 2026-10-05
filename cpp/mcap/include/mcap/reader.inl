@@ -317,10 +317,8 @@ Status McapReader::open(IReadable& reader) {
   }
 
   // Check the header magic bytes
-  if (std::memcmp(data, Magic, sizeof(Magic)) != 0) {
-    const auto msg =
-      internal::StrCat("invalid magic bytes in Header: 0x", internal::MagicToHex(data));
-    return Status{StatusCode::MagicMismatch, msg};
+  if (auto status = internal::CheckMagic(data, "in Header"); !status.ok()) {
+    return status;
   }
 
   // Read the Header record
@@ -727,11 +725,9 @@ Status McapReader::ReadFooter(IReadable& reader, uint64_t offset, Footer* footer
   }
 
   // Check the footer magic bytes
-  if (std::memcmp(data + internal::FooterLength - sizeof(Magic), Magic, sizeof(Magic)) != 0) {
-    const auto msg =
-      internal::StrCat("invalid magic bytes in Footer: 0x",
-                       internal::MagicToHex(data + internal::FooterLength - sizeof(Magic)));
-    return Status{StatusCode::MagicMismatch, msg};
+  const std::byte* magic = data + internal::FooterLength - sizeof(Magic);
+  if (auto status = internal::CheckMagic(magic, "in Footer"); !status.ok()) {
+    return status;
   }
 
   if (OpCode(data[0]) != OpCode::Footer) {
@@ -1649,10 +1645,41 @@ LinearMessageView::LinearMessageView(McapReader& mcapReader, const ReadMessageOp
     , onProblem_(onProblem) {}
 
 LinearMessageView::Iterator LinearMessageView::begin() {
-  if (dataStart_ == dataEnd_ || !mcapReader_.dataSource()) {
+  if (!mcapReader_.dataSource()) {
+    return end();
+  }
+  if (dataStart_ == dataEnd_) {
+    // Nothing to read, but the file can still be checked for its trailing magic, as it would be
+    // at the end of a read that had something to iterate.
+    if (readMessageOptions_.readOrder == ReadMessageOptions::ReadOrder::FileOrder) {
+      checkTrailingMagic();
+    }
     return end();
   }
   return LinearMessageView::Iterator{*this};
+}
+
+/**
+ * @brief Checks that the file ends with the magic bytes, so that a truncated file is reported
+ * after its last message. A file order read stops before the footer, so the magic is read
+ * directly.
+ */
+void LinearMessageView::checkTrailingMagic() {
+  auto* dataSource = mcapReader_.dataSource();
+  const uint64_t fileSize = dataSource->size();
+  if (fileSize < sizeof(Magic)) {
+    onProblem_(Status{StatusCode::FileTooSmall, "file is too small to end with magic bytes"});
+    return;
+  }
+  std::byte* data = nullptr;
+  const uint64_t bytesRead = dataSource->read(&data, fileSize - sizeof(Magic), sizeof(Magic));
+  if (bytesRead != sizeof(Magic)) {
+    onProblem_(Status{StatusCode::ReadFailed, "failed to read magic bytes at end of file"});
+    return;
+  }
+  if (auto status = internal::CheckMagic(data, "at end of file"); !status.ok()) {
+    onProblem_(status);
+  }
 }
 
 LinearMessageView::Iterator LinearMessageView::end() {
@@ -1758,6 +1785,11 @@ void LinearMessageView::Iterator::Impl::increment() {
       }
 
       if (!found) {
+        // A read that stopped on an error has already reported it above; only a read that
+        // reached its end cleanly goes on to check the trailing magic.
+        if (status.ok()) {
+          view_.checkTrailingMagic();
+        }
         recordReader_ = std::nullopt;
         return;
       }

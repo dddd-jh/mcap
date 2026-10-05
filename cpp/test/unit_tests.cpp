@@ -1408,3 +1408,130 @@ TEST_CASE("Multiple empty channels and schemas are preserved", "[reader][writer]
     reader.close();
   }
 }
+
+TEST_CASE("Linear reads check the trailing magic", "[reader]") {
+  Buffer buffer;
+  {
+    mcap::McapWriter writer;
+    mcap::McapWriterOptions opts("test");
+    opts.compression = mcap::Compression::None;
+    writer.open(buffer, opts);
+    mcap::Schema schema("schema", "schemaEncoding", "ab");
+    writer.addSchema(schema);
+    mcap::Channel channel("topic", "messageEncoding", schema.id);
+    writer.addChannel(channel);
+    std::vector<std::byte> data = {std::byte(1), std::byte(2), std::byte(3)};
+    WriteMsg(writer, channel.id, 0, 2, 1, data);
+    writer.close();
+  }
+
+  // Reads every message in file order, collecting the problems reported along the way.
+  const auto readAll = [](Buffer& source, std::vector<mcap::Status>& problems) {
+    mcap::McapReader reader;
+    requireOk(reader.open(source));
+    size_t count = 0;
+    const auto onProblem = [&](const mcap::Status& status) {
+      problems.push_back(status);
+    };
+    for (const auto& msgView : reader.readMessages(onProblem)) {
+      (void)msgView;
+      ++count;
+    }
+    return count;
+  };
+
+  SECTION("an intact file reports nothing") {
+    std::vector<mcap::Status> problems;
+    REQUIRE(readAll(buffer, problems) == 1);
+    REQUIRE(problems.empty());
+  }
+
+  SECTION("wrong trailing magic is reported after the last message") {
+    buffer.buffer.back() = std::byte(0);
+    std::vector<mcap::Status> problems;
+    REQUIRE(readAll(buffer, problems) == 1);
+    REQUIRE(problems.size() == 1);
+    REQUIRE(problems[0].code == mcap::StatusCode::MagicMismatch);
+  }
+
+  SECTION("a file cut off in its summary is reported once, after the last message") {
+    buffer.buffer.resize(buffer.buffer.size() - 20);
+    std::vector<mcap::Status> problems;
+    REQUIRE(readAll(buffer, problems) == 1);
+    REQUIRE(problems.size() == 1);
+    REQUIRE(problems[0].code == mcap::StatusCode::MagicMismatch);
+  }
+
+  SECTION("a file with no data section and wrong trailing magic is reported") {
+    Buffer headerOnly;
+    {
+      mcap::McapWriter writer;
+      mcap::McapWriterOptions opts("test");
+      opts.noSummary = true;
+      writer.open(headerOnly, opts);
+      writer.close();
+    }
+    // Drop the Data End record that follows the header, leaving the reader nothing to iterate.
+    const auto headerEnd = sizeof(mcap::Magic) + 9 +
+                           mcap::internal::ParseUint64(&headerOnly.buffer[sizeof(mcap::Magic) + 1]);
+    REQUIRE(headerOnly.buffer[headerEnd] == std::byte(mcap::OpCode::DataEnd));
+    headerOnly.buffer.erase(headerOnly.buffer.begin() + headerEnd,
+                            headerOnly.buffer.begin() + headerEnd + 9 + 4);
+    headerOnly.buffer.back() = std::byte(0);
+    std::vector<mcap::Status> problems;
+    REQUIRE(readAll(headerOnly, problems) == 0);
+    REQUIRE(problems.size() == 1);
+    REQUIRE(problems[0].code == mcap::StatusCode::MagicMismatch);
+  }
+
+  SECTION("a time range that reads no chunk still reports a file cut off in its summary") {
+    buffer.buffer.resize(buffer.buffer.size() - 20);
+    mcap::McapReader reader;
+    requireOk(reader.open(buffer));
+    requireOk(reader.readSummary(mcap::ReadSummaryMethod::AllowFallbackScan));
+    std::vector<mcap::Status> problems;
+    const auto onProblem = [&](const mcap::Status& status) {
+      problems.push_back(status);
+    };
+    size_t count = 0;
+    // The only message is at log time 2, so no chunk overlaps this range.
+    for (const auto& msgView : reader.readMessages(onProblem, 10, 20)) {
+      (void)msgView;
+      ++count;
+    }
+    REQUIRE(count == 0);
+    REQUIRE(problems.size() == 1);
+    REQUIRE(problems[0].code == mcap::StatusCode::MagicMismatch);
+  }
+
+  SECTION("a file cut off inside a record is reported once") {
+    // Written without chunks or a summary, so the records sit directly in the file:
+    // magic, header, schema, channel, message, data end, footer, magic.
+    Buffer flat;
+    {
+      mcap::McapWriter writer;
+      mcap::McapWriterOptions opts("test");
+      opts.noChunking = true;
+      opts.noSummary = true;
+      writer.open(flat, opts);
+      mcap::Schema schema("schema", "schemaEncoding", "ab");
+      writer.addSchema(schema);
+      mcap::Channel channel("topic", "messageEncoding", schema.id);
+      writer.addChannel(channel);
+      std::vector<std::byte> data(100, std::byte(7));
+      WriteMsg(writer, channel.id, 0, 2, 1, data);
+      writer.close();
+    }
+    // Cut the file partway through the message record. The reader assumes the file ends with a
+    // footer, so the cut record still starts inside the range it reads, and reading it fails.
+    uint64_t offset = sizeof(mcap::Magic);
+    while (flat.buffer[offset] != std::byte(mcap::OpCode::Message)) {
+      offset += 9 + mcap::internal::ParseUint64(&flat.buffer[offset + 1]);
+    }
+    flat.buffer.resize(offset + 60);
+    std::vector<mcap::Status> problems;
+    REQUIRE(readAll(flat, problems) == 0);
+    REQUIRE(problems.size() == 1);
+    REQUIRE(problems[0].code == mcap::StatusCode::InvalidRecord);
+  }
+}
